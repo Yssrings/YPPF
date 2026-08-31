@@ -16,6 +16,7 @@ from app.utils_dependency import *
 from app.models import (
     User,
     NaturalPerson,
+    Organization,
     Activity,
     Notification,
     ActivityPhoto,
@@ -41,7 +42,11 @@ from app.activity_utils import (
     notifyActivity,
     create_participate_infos,
 )
-from app.extern.wechat import WechatApp, WechatMessageLevel
+from app.extern.wechat import (
+    WechatApp,
+    WechatMessageLevel,
+    publish_notification,
+)
 from app.log import logger
 
 import openpyxl
@@ -68,6 +73,7 @@ __all__ = [
     'modify_course_activity',
     'cancel_course_activity',
     'registration_status_change',
+    'sync_course_member_to_future_activities',
     'course_to_display',
     'change_course_status',
     'course_base_check',
@@ -171,7 +177,9 @@ def create_single_course_activity(request: HttpRequest) -> Tuple[int, bool]:
 
     # 获取组织和课程
     org = get_person_or_org(request.user, UTYPE_ORG)
-    course = Course.objects.activated().get(organization=org)
+    # 与补选名单同步共用课程行锁，避免并发生成不完整的名单快照。
+    course = Course.objects.activated().select_for_update().get(
+        organization=org)
 
     # 查找是否有类似活动存在
     old_ones = Activity.objects.activated().filter(
@@ -512,6 +520,90 @@ def registration_status_check(course_status: Course.Status,
                     and to_status == CourseParticipant.Status.SUCCESS))
 
 
+def _add_student_to_future_course_activities(
+        course: Course, student: NaturalPerson,
+        now: datetime) -> list[Activity]:
+    """将补选成功的学生加入未来自动报名的课程活动。
+
+    调用方必须持有 ``course`` 的行锁。创建课程活动时会在读取课程名单前
+    获取同一把锁，从而避免在查询已有活动与更新选课记录之间并发创建活动。
+    """
+    activities = list(
+        Activity.objects.select_for_update().filter(
+            organization_id=course.organization,
+            category=Activity.ActivityCategory.COURSE,
+            need_apply=False,
+            start__gt=now,
+            status__in=[
+                Activity.Status.UNPUBLISHED,
+                Activity.Status.WAITING,
+            ],
+        ).order_by("pk")
+    )
+    created_activities = []
+    for activity in activities:
+        if Participation.objects.filter(
+                activity=activity, person=student).exists():
+            continue
+        Participation.objects.create(
+            activity=activity,
+            person=student,
+            status=Participation.AttendStatus.APPLYSUCCESS,
+        )
+        activity.current_participants += 1
+        # 自动报名的课程活动目前使用 capacity 表示名单人数。
+        activity.capacity = max(
+            activity.capacity, activity.current_participants)
+        activity.save(update_fields=["current_participants", "capacity"])
+        created_activities.append(activity)
+    return created_activities
+
+
+def _notify_student_of_nearest_course_activity(
+        student: NaturalPerson,
+        activities: list[Activity]) -> None:
+    """向补选学生补发最近一场未开始课程活动的通知。"""
+    if not activities:
+        return
+    activity = min(activities, key=lambda item: (item.start, item.pk))
+    content = f"课程{activity.organization_id.oname}发布了新的课程活动。"
+    content += f"\n开始时间: {activity.start.strftime('%Y-%m-%d %H:%M')}"
+    content += f"\n活动地点: {activity.location}"
+    notification = notification_create(
+        receiver=student.get_user(),
+        sender=activity.organization_id.get_user(),
+        typename=Notification.Type.NEEDREAD,
+        title=activity.title,
+        content=content,
+        URL=f"/viewActivity/{activity.id}",
+        relate_instance=activity,
+    )
+    transaction.on_commit(
+        lambda notification_id=notification.id: publish_notification(
+            notification_id, app=WechatApp.TO_PARTICIPANT))
+
+
+@transaction.atomic
+def sync_course_member_to_future_activities(
+        organization: Organization, student: NaturalPerson,
+        now: datetime | None = None) -> int:
+    """将新加入课程组织的成员同步到未来自动报名的课程活动。"""
+    if now is None:
+        now = datetime.now()
+    courses = list(
+        Course.objects.activated().select_for_update().filter(
+            organization=organization,
+            status=Course.Status.SELECT_END,
+        ).order_by("pk")
+    )
+    created_activities = []
+    for course in courses:
+        created_activities.extend(
+            _add_student_to_future_course_activities(course, student, now))
+    _notify_student_of_nearest_course_activity(student, created_activities)
+    return len(created_activities)
+
+
 def check_course_time_conflict(current_course: Course,
                                user: NaturalPerson) -> Tuple[bool, str]:
     """
@@ -600,13 +692,14 @@ def registration_status_change(course_id: int, user: NaturalPerson,
     :rtype: MESSAGECONTEXT
     """
     context = wrong("在修改选课状态的过程中发生错误，请联系管理员！")
+    now = datetime.now()
 
     # 如果不把 user 锁起来，前面做的检查到后面更新数据库时可能已经无效了，会让用户选上超过6门或者时间冲突的课。
     # 最后get是为了强制对QuerySet求值，起到上锁的效果
     NaturalPerson.objects.select_for_update().get(id=user.id)
 
-    # 在外部保证课程ID是存在的
-    course = Course.objects.get(id=course_id)
+    # 锁定课程状态和名额；课程活动创建也使用同一把锁，避免名单快照竞态。
+    course = Course.objects.select_for_update().get(id=course_id)
     course_status = course.status
 
     if (course_status != Course.Status.STAGE1
@@ -637,9 +730,6 @@ def registration_status_change(course_id: int, user: NaturalPerson,
         if is_conflict:
             return wrong(message)
             # return wrong(f'与{is_conflict}门已选课程时间冲突: {message}')
-
-        # 解锁成就-首次报名书院课程
-        unlock_achievement(user, '首次报名书院课程')
 
     else:
         # action为取消预选或退选
@@ -675,7 +765,6 @@ def registration_status_change(course_id: int, user: NaturalPerson,
                 succeed("成功取消选课！", context)
             else:
                 # 处理并发问题
-                course = Course.objects.select_for_update().get(id=course_id)
                 if (course_status == Course.Status.STAGE2
                         and course.current_participants >= course.capacity):
                     wrong("选课人数已满！", context)
@@ -688,6 +777,13 @@ def registration_status_change(course_id: int, user: NaturalPerson,
                         person = user,
                         defaults = {"status": to_status}
                     )
+                    if course_status == Course.Status.STAGE2:
+                        created_activities = _add_student_to_future_course_activities(
+                            course, user, now)
+                        _notify_student_of_nearest_course_activity(
+                            user, created_activities)
+                    # 只有选课及活动名单同步全部成功后才解锁成就。
+                    unlock_achievement(user, '首次报名书院课程')
                     succeed("选课成功！", context)
     except:
         return context
@@ -920,10 +1016,12 @@ def change_course_status(cur_status: Course.Status, to_status: Course.Status) ->
             raise AssertionError("选课已经结束，不能再变化状态")
     else:
         raise AssertionError("未提供当前状态，不允许进行选课状态修改")
-    courses = Course.objects.activated().filter(status=cur_status)
-    if to_status == Course.Status.SELECT_END:
-        courses = courses.select_related('organization')
     with transaction.atomic():
+        # 在读取选课名单前锁定课程，避免阶段结束与最后一刻补选交错，
+        # 导致学生已有选课和活动参与记录却没有课程 Position。
+        courses = Course.objects.activated().select_for_update().filter(
+            status=cur_status).order_by("pk")
+        courses = list(courses)
         for course in courses:
             if to_status == Course.Status.SELECT_END:
                 # 选课结束，将选课成功的同学批量加入小组
@@ -955,8 +1053,9 @@ def change_course_status(cur_status: Course.Status, to_status: Course.Status) ->
                 if positions:
                     with transaction.atomic():
                         Position.objects.bulk_create(positions)
-        # 更新目标状态
-        courses.select_for_update().update(status=to_status)
+        # 课程行仍由当前事务持锁，完成名单转换后再更新目标状态。
+        Course.objects.filter(pk__in=[course.pk for course in courses]).update(
+            status=to_status)
 
 
 @logger.secure_func()

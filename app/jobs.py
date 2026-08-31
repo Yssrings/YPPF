@@ -167,15 +167,16 @@ def add_week_course_activity(course_id: int, weektime_id: int, cur_week: int, co
     """
     添加每周的课程活动
     """
-    course: Course = Course.objects.get(id=course_id)
-    examine_teacher = NaturalPerson.objects.get_teacher(
-        CONFIG.course.audit_teachers[0])
-    # 当前课程在学期已举办的活动
-    conducted_num = Activity.objects.activated().filter(
-        organization_id=course.organization,
-        category=Activity.ActivityCategory.COURSE).count()
     # 发起活动，并设置报名
     with transaction.atomic():
+        # 与补选名单同步共用课程行锁，避免并发生成不完整的名单快照。
+        course: Course = Course.objects.select_for_update().get(id=course_id)
+        examine_teacher = NaturalPerson.objects.get_teacher(
+            CONFIG.course.audit_teachers[0])
+        # 当前课程在学期已举办的活动
+        conducted_num = Activity.objects.activated().filter(
+            organization_id=course.organization,
+            category=Activity.ActivityCategory.COURSE).count()
         week_time = CourseTime.objects.select_for_update().get(id=weektime_id)
         if week_time.cur_week != cur_week:
             return False
