@@ -559,10 +559,60 @@ def _add_student_to_future_course_activities(
     return created_activities
 
 
+def _remove_student_from_future_course_activities(
+        course: Course, student: NaturalPerson,
+        now: datetime) -> int:
+    """将补退选学生移出未来自动报名的课程活动。"""
+    participation_activity_ids = Participation.objects.filter(
+        person=student,
+        status__in=[
+            Participation.AttendStatus.APPLYSUCCESS,
+            Participation.AttendStatus.CANCELED,
+        ],
+    ).values("activity_id")
+    activities = list(
+        Activity.objects.select_for_update().filter(
+            pk__in=participation_activity_ids,
+            organization_id=course.organization,
+            category=Activity.ActivityCategory.COURSE,
+            need_apply=False,
+            start__gt=now,
+            status__in=[
+                Activity.Status.UNPUBLISHED,
+                Activity.Status.WAITING,
+            ],
+        ).order_by("pk")
+    )
+    removed = 0
+    for activity in activities:
+        participation = Participation.objects.filter(
+            activity=activity,
+            person=student,
+            status__in=[
+                Participation.AttendStatus.APPLYSUCCESS,
+                Participation.AttendStatus.CANCELED,
+            ],
+        ).first()
+        if participation is None:
+            continue
+        if participation.status == Participation.AttendStatus.APPLYSUCCESS:
+            activity.current_participants -= 1
+        participation.delete()
+        # 自动报名课程活动的 capacity 表示名单人数。
+        activity.capacity -= 1
+        activity.save(update_fields=["current_participants", "capacity"])
+        removed += 1
+    return removed
+
+
 def _notify_student_of_nearest_course_activity(
         student: NaturalPerson,
         activities: list[Activity]) -> None:
-    """向补选学生补发最近一场未开始课程活动的通知。"""
+    """向补选学生补发最近一场已发布、未开始课程活动的通知。"""
+    activities = [
+        activity for activity in activities
+        if activity.status == Activity.Status.WAITING
+    ]
     if not activities:
         return
     activity = min(activities, key=lambda item: (item.start, item.pk))
@@ -758,6 +808,9 @@ def registration_status_change(course_id: int, user: NaturalPerson,
     try:
         with transaction.atomic():
             if to_status == CourseParticipant.Status.UNSELECT:
+                if course_status == Course.Status.STAGE2:
+                    _remove_student_from_future_course_activities(
+                        course, user, now)
                 Course.objects.filter(id=course_id).select_for_update().update(
                     current_participants=F("current_participants") - 1)
                 CourseParticipant.objects.filter(course_id=course_id,

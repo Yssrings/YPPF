@@ -4,6 +4,7 @@ from unittest.mock import patch
 from django.test import TestCase
 
 from app.course_utils import change_course_status, registration_status_change
+from app.activity_utils import withdraw_activity_for_person
 from app.models import (
     Activity,
     Course,
@@ -111,6 +112,55 @@ class CourseLateEnrollmentTestCase(TestCase):
         self.assertEqual(activity.current_participants, 4)
         self.assertEqual(activity.capacity, 4)
 
+    @patch("app.course_utils.unlock_achievement")
+    def test_stage2_cancellation_removes_future_activity_participation(
+            self, _unlock_achievement):
+        activity = self.create_activity()
+        registration_status_change(self.course.id, self.student, "select")
+
+        result = registration_status_change(
+            self.course.id, self.student, "unselect")
+
+        self.assertEqual(result["warn_code"], 2, result)
+        self.assertFalse(CourseParticipant.objects.filter(
+            course=self.course, person=self.student).exists())
+        self.assertFalse(Participation.objects.filter(
+            activity=activity, person=self.student).exists())
+        activity.refresh_from_db()
+        self.assertEqual(activity.current_participants, 3)
+        self.assertEqual(activity.capacity, 3)
+
+    @patch("app.course_utils.unlock_achievement")
+    def test_reselection_restores_manually_canceled_course_activity(
+            self, _unlock_achievement):
+        activity = self.create_activity()
+        registration_status_change(self.course.id, self.student, "select")
+        activity.refresh_from_db()
+        with self.captureOnCommitCallbacks(execute=True):
+            withdraw_activity_for_person(self.student, activity)
+
+        result = registration_status_change(
+            self.course.id, self.student, "unselect")
+
+        self.assertEqual(result["warn_code"], 2, result)
+        self.assertFalse(Participation.objects.filter(
+            activity=activity, person=self.student).exists())
+        activity.refresh_from_db()
+        self.assertEqual(activity.current_participants, 3)
+        self.assertEqual(activity.capacity, 3)
+
+        result = registration_status_change(
+            self.course.id, self.student, "select")
+
+        self.assertEqual(result["warn_code"], 2, result)
+        participation = Participation.objects.get(
+            activity=activity, person=self.student)
+        self.assertEqual(
+            participation.status, Participation.AttendStatus.APPLYSUCCESS)
+        activity.refresh_from_db()
+        self.assertEqual(activity.current_participants, 4)
+        self.assertEqual(activity.capacity, 4)
+
     @patch("app.course_utils.publish_notification")
     @patch("app.course_utils.unlock_achievement")
     def test_stage2_selection_only_notifies_nearest_new_activity(
@@ -140,6 +190,36 @@ class CourseLateEnrollmentTestCase(TestCase):
         self.assertEqual(notification.title, nearest_activity.title)
         self.assertFalse(Notification.objects.filter(
             relate_instance=farther_activity).exists())
+        publish_notification.assert_called_once_with(
+            notification.id, app=WechatApp.TO_PARTICIPANT)
+
+    @patch("app.course_utils.publish_notification")
+    @patch("app.course_utils.unlock_achievement")
+    def test_stage2_selection_defers_unpublished_activity_notification(
+            self, _unlock_achievement, publish_notification):
+        unpublished = self.create_activity(
+            title="Unpublished activity",
+            status=Activity.Status.UNPUBLISHED,
+            start=datetime.now() + timedelta(hours=2),
+            end=datetime.now() + timedelta(hours=4),
+            publish_time=datetime.now() + timedelta(hours=1),
+        )
+        published = self.create_activity(
+            title="Published activity",
+            start=datetime.now() + timedelta(days=1),
+            end=datetime.now() + timedelta(days=1, hours=2),
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            result = registration_status_change(
+                self.course.id, self.student, "select")
+
+        self.assertEqual(result["warn_code"], 2, result)
+        self.assertTrue(Participation.objects.filter(
+            activity=unpublished, person=self.student).exists())
+        notification = Notification.objects.get(
+            receiver=self.student.get_user())
+        self.assertEqual(notification.relate_instance_id, published.pk)
         publish_notification.assert_called_once_with(
             notification.id, app=WechatApp.TO_PARTICIPANT)
 
